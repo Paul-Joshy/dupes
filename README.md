@@ -40,7 +40,8 @@ Finder reveal are macOS-specific. Linux works for scanning/reporting but
 ```sh
 dupes                     # scan config targets (default: ~/Documents)
 dupes ~/Pictures          # scan a specific directory
-dupes ~/A ~/B             # multiple dirs → pick one at startup
+dupes ~/A ~/B             # scan several dirs as ONE space — groups include
+                          # duplicates within each dir AND across dirs
 dupes --report ~/A        # print a plain-text waste report, no TUI
 dupes --trash ~/A         # non-interactive cleanup (with a y/N prompt)
 dupes --help | --version
@@ -96,7 +97,8 @@ Set `DUPES_CONFIG=/path/to/config.toml` to use a different config file.
 
 ## How it works
 
-1. Walk the tree, skipping excluded dirs and zero-byte files
+1. Walk every target into one bucket-by-size map (cheap pre-filter); all
+   targets are scanned together, so groups can span directories
 2. Bucket files by size (cheap pre-filter)
 3. MD5 only the buckets with ≥2 files, through a shared mtime-keyed cache
    (`~/.cache/dedupe-hashes.tsv`) so repeat runs are fast

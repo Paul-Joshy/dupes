@@ -228,8 +228,9 @@ const configPath = "~/.config/dupes/config.toml"
 
 const defaultConfig = `# dupes configuration (~/.config/dupes/config.toml)
 
-# Directories to scan. With more than one, a picker is shown at startup.
-# Paths given on the command line override this.
+# Directories to scan — all scanned together as one space, so duplicates
+# within each directory AND across directories are found. Paths given on
+# the command line override this.
 targets = ["~/Documents"]
 
 # Extra directory names to skip anywhere in the tree, on top of the
@@ -341,11 +342,9 @@ func abbreviateRel(rel string) string {
 // ---------- model ----------
 
 type model struct {
-	root     string
+	roots    []string // all scanned as one space; groups may span roots
 	cfg      Config
-	targets  []string // >1 target → picker phase first
-	phase    string   // pick | loading | scanning | hashing | ready | trashing | done
-	pickCur  int
+	phase    string   // loading | scanning | hashing | ready | trashing | done
 	keymap   map[string]string // key press → action name
 	groups   []*Group
 	cache    map[string]cacheEnt
@@ -366,14 +365,10 @@ type model struct {
 
 func initialModel(cfg Config, targets []string) model {
 	kb := mergedKeybinds(cfg.Keybinds)
-	phase := "loading"
-	if len(targets) > 1 {
-		phase = "pick"
-	}
 	return model{
 		cfg:      cfg,
-		targets:  targets,
-		phase:    phase,
+		roots:    targets,
+		phase:    "loading",
 		keymap:   keyToAction(kb),
 		cache:    map[string]cacheEnt{},
 		expanded: map[*Group]bool{},
@@ -381,18 +376,16 @@ func initialModel(cfg Config, targets []string) model {
 }
 
 func (m model) Init() tea.Cmd {
-	if m.phase == "pick" {
-		return nil
-	}
-	return scanCmd(m.root)
+	return scanCmd(m.roots)
 }
 
 // ---------- scan / trash commands ----------
 
-// findGroups runs the whole scan→hash→group pipeline for one root and
-// returns the duplicate groups plus the (possibly updated) hash cache.
-// notify (may be nil) receives phase/progress updates.
-func findGroups(root string, notify func(phase string, n, total int)) ([]*Group, map[string]cacheEnt, error) {
+// findGroups runs the whole scan→hash→group pipeline for one or more roots,
+// treated as a single space: duplicates are found within each root and
+// across roots. Returns the duplicate groups plus the (possibly updated)
+// hash cache. notify (may be nil) receives phase/progress updates.
+func findGroups(roots []string, notify func(phase string, n, total int)) ([]*Group, map[string]cacheEnt, error) {
 	cache := loadCache()
 	changed := false
 	send := func(phase string, n, total int) {
@@ -401,28 +394,30 @@ func findGroups(root string, notify func(phase string, n, total int)) ([]*Group,
 		}
 	}
 
-	// walk
+	// walk every root into one size→paths map
 	sizeMap := map[int64][]string{}
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if info.IsDir() {
-			name := info.Name()
-			if path != root && excludeDirs[name] {
-				return filepath.SkipDir
+	for _, root := range roots {
+		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
 			}
+			if info.IsDir() {
+				name := info.Name()
+				if path != root && excludeDirs[name] {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if info.Name() == ".DS_Store" || info.Size() == 0 {
+				return nil
+			}
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+			sizeMap[info.Size()] = append(sizeMap[info.Size()], path)
 			return nil
-		}
-		if info.Name() == ".DS_Store" || info.Size() == 0 {
-			return nil
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-		sizeMap[info.Size()] = append(sizeMap[info.Size()], path)
-		return nil
-	})
+		})
+	}
 	send("hashing", 0, 0)
 
 	total := 0
@@ -490,7 +485,7 @@ func findGroups(root string, notify func(phase string, n, total int)) ([]*Group,
 	return groups, cache, nil
 }
 
-func scanCmd(root string) tea.Cmd {
+func scanCmd(roots []string) tea.Cmd {
 	p := activeProg
 	return func() tea.Msg {
 		notify := func(phase string, n, total int) {
@@ -498,7 +493,7 @@ func scanCmd(root string) tea.Cmd {
 				p.Send(progMsg{phase, n, total})
 			}
 		}
-		groups, cache, err := findGroups(root, notify)
+		groups, cache, err := findGroups(roots, notify)
 		if err != nil {
 			return scanDoneMsg{err: err.Error()}
 		}
@@ -662,32 +657,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		k := msg.String()
-		if m.phase == "pick" {
-			switch k {
-			case "q", "esc", "ctrl+c":
-				m.quitting = true
-				return m, tea.Quit
-			case "j", "down":
-				m.pickCur++
-				if m.pickCur >= len(m.targets) {
-					m.pickCur = len(m.targets) - 1
-				}
-			case "k", "up":
-				m.pickCur--
-				if m.pickCur < 0 {
-					m.pickCur = 0
-				}
-			case "g":
-				m.pickCur = 0
-			case "G":
-				m.pickCur = len(m.targets) - 1
-			case "enter":
-				m.root = m.targets[m.pickCur]
-				m.phase = "loading"
-				return m, scanCmd(m.root)
-			}
-			return m, nil
-		}
 		if m.typing {
 			switch k {
 			case "esc":
@@ -812,7 +781,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "rescan":
 			m.phase = "loading"
 			m.groups = nil
-			return m, scanCmd(m.root)
+			return m, scanCmd(m.roots)
 		}
 	}
 	return m, nil
@@ -937,17 +906,41 @@ func human(b int64) string {
 	}
 }
 
+// titleRoots renders the scanned directories for the header, e.g.
+// "~/Documents" or "~/dir-1 + ~/dir-2 (+ 1 more)". Single-root keeps the
+// old look; more than three gets summarized to keep the title short.
+func (m model) titleRoots() string {
+	switch len(m.roots) {
+	case 0:
+		return ""
+	case 1:
+		return tilde(m.roots[0])
+	}
+	shown := m.roots
+	if len(m.roots) > 3 {
+		shown = m.roots[:3]
+	}
+	s := tilde(shown[0])
+	for _, r := range shown[1:] {
+		s += " + " + tilde(r)
+	}
+	if len(shown) < len(m.roots) {
+		s += fmt.Sprintf(" (+ %d more)", len(m.roots)-len(shown))
+	}
+	return s
+}
+
 func (m model) header() string {
 	switch m.phase {
 	case "loading":
-		return titleStyle.Render("dupes "+tilde(m.root)) + "  " + subStyle.Render("scanning…")
+		return titleStyle.Render("dupes "+m.titleRoots()) + "  " + subStyle.Render("scanning…")
 	case "scanning":
-		return titleStyle.Render("dupes "+tilde(m.root)) + "  " + subStyle.Render("scanning… (cache makes reruns fast)")
+		return titleStyle.Render("dupes "+m.titleRoots()) + "  " + subStyle.Render("scanning… (cache makes reruns fast)")
 	case "hashing":
-		return titleStyle.Render("dupes "+tilde(m.root)) + "  " +
+		return titleStyle.Render("dupes "+m.titleRoots()) + "  " +
 			subStyle.Render(fmt.Sprintf("hashing… %s/%s files", comma(m.progN), comma(m.progTot)))
 	case "trashing":
-		return titleStyle.Render("dupes "+tilde(m.root)) + "  " +
+		return titleStyle.Render("dupes "+m.titleRoots()) + "  " +
 			errStyle.Render(fmt.Sprintf("trashing… %d/%d (checksum-verifying each)", m.progN, m.progTot))
 	}
 	var ng, nw, ns, sw int
@@ -961,7 +954,7 @@ func (m model) header() string {
 			wsel += g.wasted()
 		}
 	}
-	t := fmt.Sprintf("dupes %s — %s groups · %s wasted", tilde(m.root), comma(ng), human(int64(sw)))
+	t := fmt.Sprintf("dupes %s — %s groups · %s wasted", m.titleRoots(), comma(ng), human(int64(sw)))
 	title := titleStyle.Render(t)
 	sel := subStyle.Render(fmt.Sprintf(" · selected %s (%s)", comma(ns), human(wsel)))
 	f := ""
@@ -1003,9 +996,6 @@ func (m model) footer() string {
 func (m model) View() string {
 	if m.width == 0 {
 		return "starting…"
-	}
-	if m.phase == "pick" {
-		return m.pickView()
 	}
 	var b strings.Builder
 	b.WriteString(m.header() + "\n")
@@ -1128,34 +1118,29 @@ func (m model) memberRow(g *Group, i int, curs string) string {
 	return fmt.Sprintf("%s   %s %s", curs, mark, style.Render(m.pathOf(g.paths[i])))
 }
 
-// pathOf applies the configured path display style. Relative to the scan
-// root (already in the title), with directories collapsed to first letters.
+// pathOf applies the configured path display style. Relative to the
+// matching scan root (already in the title), with directories collapsed.
 func (m model) pathOf(p string) string {
 	if m.cfg.ShowFullPaths {
 		return tilde(p)
 	}
-	if m.root != "" && strings.HasPrefix(p, m.root+"/") {
-		return abbreviateRel(p[len(m.root)+1:])
+	// longest matching root wins, so nested roots display sensibly
+	best := ""
+	for _, r := range m.roots {
+		if strings.HasPrefix(p, r+"/") && len(r) > len(best) {
+			best = r
+		}
+	}
+	if best != "" {
+		s := abbreviateRel(p[len(best)+1:])
+		// with multiple roots, a bare filename could belong to any of
+		// them — prefix the root's name so rows stay unambiguous
+		if len(m.roots) > 1 && !strings.Contains(s, "/") {
+			s = filepath.Base(best) + "/" + s
+		}
+		return s
 	}
 	return abbreviate(tilde(p))
-}
-
-func (m model) pickView() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("dupes — choose a directory to scan") + "\n\n")
-	for i, t := range m.targets {
-		curs := "  "
-		style := dimStyle
-		if i == m.pickCur {
-			curs = "▸ "
-			style = lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
-		}
-		b.WriteString(fmt.Sprintf("%s%s\n", curs, style.Render(tilde(t))))
-	}
-	b.WriteString("\n" + footerKey.Render("j/k") + footerTxt.Render(" move · ") +
-		footerKey.Render("enter") + footerTxt.Render(" scan · ") +
-		footerKey.Render("q") + footerTxt.Render(" quit"))
-	return b.String()
 }
 
 func (m model) confirmView() string {
@@ -1209,7 +1194,8 @@ const version = "0.1.0"
 const usage = `dupes — find duplicate files, safely
 
 Usage:
-  dupes [paths…]              interactive TUI (paths override config targets)
+  dupes [paths…]              interactive TUI; all paths are scanned together
+                              as one space (duplicates within AND across them)
   dupes --report [paths…]     print a waste report and exit (no TUI)
   dupes --trash [paths…]      trash every non-first twin of every group, then exit
   dupes --help | --version
@@ -1280,9 +1266,6 @@ func main() {
 		runTrash(valid)
 	default:
 		m := initialModel(cfg, valid)
-		if len(valid) == 1 {
-			m.root = valid[0]
-		}
 		activeProg = tea.NewProgram(m, tea.WithAltScreen())
 		if _, err := activeProg.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, "dupes:", err)
@@ -1291,48 +1274,37 @@ func main() {
 	}
 }
 
-// runReport scans each target and prints a plain-text summary of the
-// duplicate groups, biggest waste first. Interactive: no.
+// runReport scans all targets as one space and prints a plain-text
+// summary of the duplicate groups, biggest waste first.
 func runReport(roots []string) {
-	totalWasted := int64(0)
-	totalGroups := 0
-	for _, root := range roots {
-		groups, _, err := findGroups(root, func(phase string, n, total int) {
-			fmt.Fprintf(os.Stderr, "\r%s %d/%d", phase, n, total)
-		})
-		fmt.Fprint(os.Stderr, "\r\033[K")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "dupes:", err)
-			os.Exit(1)
-		}
-		if len(roots) > 1 {
-			fmt.Printf("\n# %s\n", root)
-		}
-		for _, g := range groups {
-			totalGroups++
-			totalWasted += g.wasted()
-			fmt.Printf("%10s  ×%d  %s\n",
-				human(g.wasted()), len(g.paths), strings.Join(g.paths, "  +  "))
-		}
+	groups, _, err := findGroups(roots, func(phase string, n, total int) {
+		fmt.Fprintf(os.Stderr, "\r%s %d/%d", phase, n, total)
+	})
+	fmt.Fprint(os.Stderr, "\r\033[K")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "dupes:", err)
+		os.Exit(1)
 	}
-	fmt.Printf("\n%d groups · %s wasted\n", totalGroups, human(totalWasted))
+	wasted := int64(0)
+	for _, g := range groups {
+		wasted += g.wasted()
+		fmt.Printf("%10s  ×%d  %s\n",
+			human(g.wasted()), len(g.paths), strings.Join(g.paths, "  +  "))
+	}
+	fmt.Printf("\n%d groups · %s wasted\n", len(groups), human(wasted))
 }
 
 // runTrash is the non-interactive cleanup: for every group, keep the first
 // path (sorted) and trash the rest — with the same md5 re-verification and
 // manifest as the TUI. Requires a confirmation prompt on stdin.
 func runTrash(roots []string) {
-	var groups []*Group
-	for _, root := range roots {
-		gs, _, err := findGroups(root, func(phase string, n, total int) {
-			fmt.Fprintf(os.Stderr, "\r%s %d/%d", phase, n, total)
-		})
-		fmt.Fprint(os.Stderr, "\r\033[K")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "dupes:", err)
-			os.Exit(1)
-		}
-		groups = append(groups, gs...)
+	groups, _, err := findGroups(roots, func(phase string, n, total int) {
+		fmt.Fprintf(os.Stderr, "\r%s %d/%d", phase, n, total)
+	})
+	fmt.Fprint(os.Stderr, "\r\033[K")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "dupes:", err)
+		os.Exit(1)
 	}
 	if len(groups) == 0 {
 		fmt.Println("no duplicates found — nothing to do")
